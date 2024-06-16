@@ -62,22 +62,16 @@ pub mod solana_amm {
     }
 
     pub fn remove_liquidity(ctx: Context<RemoveLiquidity>, amount_a: u64) -> Result<()> {
+        msg!("Removing liquidity: {} tokens", amount_a);
         let amm = ctx.accounts.amm.clone();
-
-        // Adjust amount_a to match the token decimals (multiply by 10^9) for calculations
         let amount_a_adjusted = amount_a as u128 * 1_000_000_000;
 
-        require!(
-            amm.reserve_a >= amount_a as u128,
-            AmmError::InsufficientLiquidityA
-        );
-        let sol_amount = amount_a * (amm.reserve_sol / amm.reserve_a) as u64;
-        require!(
-            amm.reserve_sol >= sol_amount as u128,
-            AmmError::InsufficientLiquiditySol
-        );
+        require!(amm.reserve_a >= amount_a as u128, AmmError::InsufficientLiquidityA);
+        let sol_amount = (amount_a as u128 * amm.reserve_sol) / amm.reserve_a;
+        require!(amm.reserve_sol >= sol_amount, AmmError::InsufficientLiquiditySol);
 
-        // Transfer tokens from AMM to user
+        msg!("Calculated sol_amount to withdraw: {}", sol_amount);
+
         let seeds = &[b"amm".as_ref(), &[ctx.accounts.amm.bump]];
         let signer_seeds = &[&seeds[..]];
         let cpi_accounts = Transfer {
@@ -89,32 +83,20 @@ pub mod solana_amm {
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
         token::transfer(cpi_ctx, amount_a_adjusted as u64)?;
 
-        // Transfer SOL from AMM to user
-        let transfer_instruction = system_instruction::transfer(
-            &ctx.accounts.amm.key(),
-            &ctx.accounts.user.key(),
-            sol_amount,
-        );
-        anchor_lang::solana_program::program::invoke_signed(
-            &transfer_instruction,
-            &[
-                ctx.accounts.amm.to_account_info(),
-                ctx.accounts.user.to_account_info(),
-            ],
-            signer_seeds,
-        )?;
+        **ctx.accounts.amm.to_account_info().try_borrow_mut_lamports()? -= sol_amount as u64;
+        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += sol_amount as u64;
 
-        // Update `amm` after transfers
         let amm = &mut ctx.accounts.amm;
-        amm.reserve_a -= amount_a as u128; // Subtract the raw amount
-        amm.reserve_sol -= sol_amount as u128;
+        amm.reserve_a -= amount_a as u128;
+        amm.reserve_sol -= sol_amount;
 
         emit!(LiquidityRemoved {
             provider: *ctx.accounts.user.key,
             amount_a,
-            amount_sol: sol_amount,
+            amount_sol: sol_amount as u64,
         });
 
+        msg!("Liquidity removed successfully");
         Ok(())
     }
 
@@ -168,12 +150,9 @@ pub mod solana_amm {
     pub fn sell(ctx: Context<Sell>, amount_a: u64) -> Result<()> {
         let amm = ctx.accounts.amm.clone();
 
-        // Adjust amount_a to match the token decimals (multiply by 10^9) for transfer
         let amount_a_adjusted = amount_a as u128 * 1_000_000_000;
+        msg!("Amount A Adjusted: {}", amount_a_adjusted);
 
-        msg!("Attempting to sell {} tokens", amount_a);
-
-        // Transfer tokens from user to the AMM account
         let cpi_accounts = Transfer {
             from: ctx.accounts.user_token_a.to_account_info(),
             to: ctx.accounts.amm_token_a.to_account_info(),
@@ -183,29 +162,13 @@ pub mod solana_amm {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, amount_a_adjusted as u64)?;
 
-        // Calculate SOL amount with 9 decimals precision
         let sol_amount = get_amount_out(amount_a as u128, amm.reserve_a, amm.reserve_sol) as u64;
 
-        // Transfer SOL from AMM to user
-        let seeds = &[b"amm".as_ref(), &[ctx.accounts.amm.bump]];
-        let signer_seeds = &[&seeds[..]];
-        let transfer_instruction = system_instruction::transfer(
-            &ctx.accounts.amm.key(),
-            &ctx.accounts.user.key(),
-            sol_amount,
-        );
-        anchor_lang::solana_program::program::invoke_signed(
-            &transfer_instruction,
-            &[
-                ctx.accounts.amm.to_account_info(),
-                ctx.accounts.user.to_account_info(),
-            ],
-            signer_seeds,
-        )?;
+        **ctx.accounts.amm.to_account_info().try_borrow_mut_lamports()? -= sol_amount;
+        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += sol_amount;
 
-        // Update `amm` after transfers
         let amm = &mut ctx.accounts.amm;
-        amm.reserve_a += amount_a as u128; // Add the raw amount
+        amm.reserve_a += amount_a as u128;
         amm.reserve_sol -= sol_amount as u128;
 
         emit!(TokensSold {
@@ -216,11 +179,27 @@ pub mod solana_amm {
 
         Ok(())
     }
+
+    pub fn get_price(ctx: Context<GetPrice>) -> Result<()> {
+        let amm = &ctx.accounts.amm;
+
+        // Ensure that the reserves are not zero to avoid division by zero
+        if amm.reserve_a == 0 || amm.reserve_sol == 0 {
+            return Err(AmmError::InsufficientLiquidity.into());
+        }
+
+        // Calculate price as reserve_sol / reserve_a
+        let price = (amm.reserve_sol / amm.reserve_a) as u64;
+        msg!("Price of Token A in Lamports: {:.10}", price);
+
+        Ok(())
+    }
+
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = user, space = 8 + 16 + 16 + 1, seeds = [b"amm"], bump)]
+    #[account(init, payer = user, space = 8 + 48, seeds = [b"amm"], bump)]
     pub amm: Account<'info, Amm>,
     #[account(mut)]
     pub user: Signer<'info>,
@@ -283,19 +262,17 @@ pub struct Sell<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct GetPrice<'info> {
+    #[account(seeds = [b"amm"], bump = amm.bump)]
+    pub amm: Account<'info, Amm>,
+}
+
 #[account]
 pub struct Amm {
     pub reserve_a: u128, // This stores tokens with 9 decimal places
     pub reserve_sol: u128,
     pub bump: u8,
-}
-
-#[error_code]
-pub enum AmmError {
-    #[msg("Insufficient liquidity for TokenA")]
-    InsufficientLiquidityA,
-    #[msg("Insufficient liquidity for SOL")]
-    InsufficientLiquiditySol,
 }
 
 fn get_amount_out(input_amount: u128, input_reserve: u128, output_reserve: u128) -> u128 {
@@ -339,4 +316,14 @@ pub struct TokensSold {
     pub seller: Pubkey,
     pub amount_a: u64,
     pub amount_sol: u64,
+}
+
+#[error_code]
+pub enum AmmError {
+    #[msg("Insufficient liquidity for TokenA")]
+    InsufficientLiquidityA,
+    #[msg("Insufficient liquidity for SOL")]
+    InsufficientLiquiditySol,
+    #[msg("Insufficient liquidity for price calculation")]
+    InsufficientLiquidity,
 }
